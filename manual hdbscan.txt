@@ -1,0 +1,509 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import sqrt
+from typing import List, Tuple, Dict, Optional
+import random
+
+
+# ----------------------------
+# Distancias (puro Python)
+# ----------------------------
+
+def _dot(a: List[float], b: List[float]) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+def _norm(a: List[float]) -> float:
+    return sqrt(_dot(a, a))
+
+def cosine_distance(a: List[float], b: List[float], eps: float = 1e-12) -> float:
+    na = _norm(a)
+    nb = _norm(b)
+    if na < eps or nb < eps:
+        # Si algún vector es casi cero, evita división por cero:
+        # trátalo como "muy lejos" (distancia 1).
+        return 1.0
+    sim = _dot(a, b) / (na * nb)
+    # Por estabilidad numérica
+    if sim > 1.0: sim = 1.0
+    if sim < -1.0: sim = -1.0
+    return 1.0 - sim
+
+def euclidean_distance(a: List[float], b: List[float]) -> float:
+    s = 0.0
+    for x, y in zip(a, b):
+        t = x - y
+        s += t * t
+    return sqrt(s)
+
+
+# ----------------------------
+# Matriz de distancias O(n^2)
+# ----------------------------
+
+def pairwise_distance_matrix(X: List[List[float]], metric: str) -> List[List[float]]:
+    n = len(X)
+    D = [[0.0] * n for _ in range(n)]
+    if metric == "cosine":
+        dist_fn = cosine_distance
+    elif metric == "euclidean":
+        dist_fn = euclidean_distance
+    else:
+        raise ValueError("metric debe ser 'cosine' o 'euclidean'.")
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = dist_fn(X[i], X[j])
+            D[i][j] = d
+            D[j][i] = d
+    return D
+
+
+# ----------------------------
+# Core distance y Mutual Reachability
+# ----------------------------
+
+def core_distances(D: List[List[float]], k: int) -> List[float]:
+    """
+    core_dist(i) = distancia al k-ésimo vecino más cercano (excluyendo i).
+    k corresponde a min_samples.
+    """
+    n = len(D)
+    core = [0.0] * n
+    for i in range(n):
+        ds = [D[i][j] for j in range(n) if j != i]
+        ds.sort()
+        core[i] = ds[k - 1]
+    return core
+
+def mutual_reachability_matrix(D: List[List[float]], core: List[float]) -> List[List[float]]:
+    n = len(D)
+    MR = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            mr = max(core[i], core[j], D[i][j])
+            MR[i][j] = mr
+            MR[j][i] = mr
+    return MR
+
+
+# ----------------------------
+# MST (Prim) para obtener "escalas" candidatas
+# ----------------------------
+
+def prim_mst_edges(W: List[List[float]]) -> List[Tuple[int, int, float]]:
+    """
+    MST con Prim usando matriz completa W (O(n^2)).
+    Retorna lista de aristas (u, v, w).
+    """
+    n = len(W)
+    in_mst = [False] * n
+    key = [float("inf")] * n
+    parent = [-1] * n
+
+    key[0] = 0.0
+    for _ in range(n):
+        # elige u con menor key fuera del MST
+        u = -1
+        best = float("inf")
+        for i in range(n):
+            if (not in_mst[i]) and key[i] < best:
+                best = key[i]
+                u = i
+        in_mst[u] = True
+
+        # relaja vecinos
+        Wu = W[u]
+        for v in range(n):
+            w = Wu[v]
+            if (not in_mst[v]) and w < key[v]:
+                key[v] = w
+                parent[v] = u
+
+    edges = []
+    for v in range(1, n):
+        u = parent[v]
+        edges.append((u, v, W[u][v]))
+    return edges
+
+
+# ----------------------------
+# DBSCAN sobre matriz de distancias precomputada
+# ----------------------------
+
+def dbscan_precomputed(
+    W: List[List[float]],
+    eps: float,
+    min_samples: int,
+) -> List[int]:
+    """
+    DBSCAN usando matriz de distancias W (precomputada).
+    Devuelve labels: -1 ruido, 0..K-1 clusters.
+    """
+    n = len(W)
+    UNVISITED = 0
+    NOISE = -1
+
+    state = [UNVISITED] * n
+    labels = [NOISE] * n
+    cluster_id = 0
+
+    # precompute neighbors dentro de eps (O(n^2))
+    neighbors = []
+    for i in range(n):
+        nbrs = [j for j in range(n) if W[i][j] <= eps]
+        neighbors.append(nbrs)
+
+    def is_core(i: int) -> bool:
+        return len(neighbors[i]) >= min_samples
+
+    for i in range(n):
+        if state[i] != UNVISITED:
+            continue
+        state[i] = 1  # visited
+
+        if not is_core(i):
+            labels[i] = NOISE
+            continue
+
+        # expand cluster
+        labels[i] = cluster_id
+        seeds = neighbors[i].copy()
+
+        # BFS/stack
+        idx = 0
+        while idx < len(seeds):
+            p = seeds[idx]
+            idx += 1
+
+            if state[p] == UNVISITED:
+                state[p] = 1
+                if is_core(p):
+                    # agrega vecinos
+                    for q in neighbors[p]:
+                        if q not in seeds:
+                            seeds.append(q)
+
+            if labels[p] == NOISE:
+                labels[p] = cluster_id
+
+        cluster_id += 1
+
+    return labels
+
+
+# ----------------------------
+# Selección de eps (heurística de estabilidad)
+# ----------------------------
+
+def _cluster_members(labels: List[int]) -> Dict[int, List[int]]:
+    clusters: Dict[int, List[int]] = {}
+    for i, lab in enumerate(labels):
+        if lab == -1:
+            continue
+        clusters.setdefault(lab, []).append(i)
+    return clusters
+
+def choose_eps_by_stability(
+    W: List[List[float]],
+    eps_candidates: List[float],
+    min_samples: int,
+    min_cluster_size: int,
+    noise_weight: float = 0.4,
+) -> Tuple[float, List[int]]:
+    """
+    Recorre eps candidatos y escoge el que maximiza un score:
+      score = stability_like - noise_weight * noise_rate + small_bonus*num_clusters
+    donde stability_like aproxima persistencia por eps.
+    """
+    # Asegura orden
+    eps_candidates = sorted(set(eps_candidates))
+    if len(eps_candidates) < 2:
+        # fallback
+        eps = eps_candidates[0] if eps_candidates else 0.5
+        labels = dbscan_precomputed(W, eps, min_samples)
+        return eps, labels
+
+    best_score = float("-inf")
+    best_eps = eps_candidates[0]
+    best_labels: List[int] = [-1] * len(W)
+
+    prev_labels: Optional[List[int]] = None
+    prev_clusters: Optional[Dict[int, List[int]]] = None
+
+    # Usamos incrementos de eps; clusters que “sobreviven” suman área ~ size * delta_eps
+    running_stability = 0.0
+
+    for t in range(len(eps_candidates) - 1):
+        eps = eps_candidates[t]
+        eps_next = eps_candidates[t + 1]
+        delta = eps_next - eps
+        if delta <= 0:
+            continue
+
+        labels = dbscan_precomputed(W, eps, min_samples)
+        clusters = _cluster_members(labels)
+
+        # filtra clusters pequeños (como haría min_cluster_size en HDBSCAN)
+        clusters = {cid: pts for cid, pts in clusters.items() if len(pts) >= min_cluster_size}
+
+        n = len(labels)
+        noise = sum(1 for lab in labels if lab == -1)
+        noise_rate = noise / max(1, n)
+        num_clusters = len(clusters)
+
+        # Estabilidad aproximada: si un cluster se parece mucho al de la escala anterior, suma persistencia
+        if prev_labels is not None and prev_clusters is not None:
+            # Matching simple por solapamiento (Jaccard)
+            used_prev = set()
+            for cid, pts in clusters.items():
+                S = set(pts)
+                best_j = 0.0
+                best_prev = None
+                for pcid, ppts in prev_clusters.items():
+                    if pcid in used_prev:
+                        continue
+                    P = set(ppts)
+                    inter = len(S & P)
+                    union = len(S | P)
+                    j = inter / union if union else 0.0
+                    if j > best_j:
+                        best_j = j
+                        best_prev = pcid
+
+                if best_prev is not None and best_j >= 0.5:
+                    used_prev.add(best_prev)
+                    running_stability += len(pts) * delta
+
+        # score total en este eps
+        score = running_stability - noise_weight * noise_rate + 0.02 * num_clusters
+
+        if score > best_score and num_clusters > 0:
+            best_score = score
+            best_eps = eps
+            # reconstruye labels “limpios” (aplicando filtro min_cluster_size)
+            # volvemos a crear labels, marcando clusters pequeños como ruido
+            cleaned = labels[:]
+            small = _cluster_members(cleaned)
+            for cid, pts in small.items():
+                if len(pts) < min_cluster_size:
+                    for i in pts:
+                        cleaned[i] = -1
+            best_labels = cleaned
+
+        prev_labels = labels
+        prev_clusters = clusters
+
+    return best_eps, best_labels
+
+
+# ----------------------------
+# Representantes y predicción
+# ----------------------------
+
+def _centroid(X: List[List[float]], idxs: List[int]) -> List[float]:
+    d = len(X[0])
+    c = [0.0] * d
+    for i in idxs:
+        xi = X[i]
+        for k in range(d):
+            c[k] += xi[k]
+    inv = 1.0 / max(1, len(idxs))
+    for k in range(d):
+        c[k] *= inv
+    return c
+
+def _dist_to_centroid(
+    x: List[float],
+    c: List[float],
+    metric: str
+) -> float:
+    if metric == "cosine":
+        return cosine_distance(x, c)
+    return euclidean_distance(x, c)
+
+def _percentile(values: List[float], p: float) -> float:
+    # p in [0,1]
+    if not values:
+        return 0.0
+    vs = sorted(values)
+    k = int(round(p * (len(vs) - 1)))
+    return vs[k]
+
+
+@dataclass
+class HDBSCANLiteModel:
+    metric: str
+    min_samples: int
+    min_cluster_size: int
+    eps: float
+    labels_: List[int]
+    centroids_: Dict[int, List[float]]
+    radii_: Dict[int, float]  # umbral de aceptación por cluster (percentil)
+
+
+class HDBSCANLite:
+    def __init__(
+        self,
+        metric: str = "cosine",
+        min_samples: int = 10,
+        min_cluster_size: int = 20,
+        eps_levels: int = 60,
+        radius_percentile: float = 0.95,
+        noise_weight: float = 0.4,
+        seed: int = 7,
+    ):
+        self.metric = metric
+        self.min_samples = min_samples
+        self.min_cluster_size = min_cluster_size
+        self.eps_levels = eps_levels
+        self.radius_percentile = radius_percentile
+        self.noise_weight = noise_weight
+        self.seed = seed
+        self.model_: Optional[HDBSCANLiteModel] = None
+        self._X_fit: Optional[List[List[float]]] = None
+
+    def fit(self, X: List[List[float]]) -> HDBSCANLiteModel:
+        if not X:
+            raise ValueError("X está vacío.")
+        if self.min_samples < 2:
+            raise ValueError("min_samples debe ser >= 2.")
+        if self.min_cluster_size < 2:
+            raise ValueError("min_cluster_size debe ser >= 2.")
+
+        n = len(X)
+        if self.min_samples > n - 1:
+            raise ValueError("min_samples es demasiado grande para n.")
+
+        self._X_fit = X
+
+        # 1) Distancias base
+        D = pairwise_distance_matrix(X, self.metric)
+
+        # 2) Core distances
+        core = core_distances(D, k=self.min_samples)
+
+        # 3) Mutual reachability
+        MR = mutual_reachability_matrix(D, core)
+
+        # 4) eps candidatos (tomamos pesos del MST y muestreamos niveles)
+        mst_edges = prim_mst_edges(MR)
+        weights = sorted(w for _, _, w in mst_edges)
+
+        # sample eps_levels valores (incluye extremos)
+        random.seed(self.seed)
+        if len(weights) <= self.eps_levels:
+            eps_candidates = weights
+        else:
+            # muestreo por cuantiles simples
+            eps_candidates = []
+            for i in range(self.eps_levels):
+                q = i / (self.eps_levels - 1)
+                eps_candidates.append(_percentile(weights, q))
+
+        # 5) elegir eps y labels
+        eps, labels = choose_eps_by_stability(
+            MR,
+            eps_candidates=eps_candidates,
+            min_samples=self.min_samples,
+            min_cluster_size=self.min_cluster_size,
+            noise_weight=self.noise_weight,
+        )
+
+        # 6) construir centroides y radios por cluster para predict
+        clusters = _cluster_members(labels)
+        # filtra clusters reales
+        clusters = {cid: pts for cid, pts in clusters.items() if len(pts) >= self.min_cluster_size}
+
+        # reindex clusters para que queden 0..K-1
+        old_to_new = {old: new for new, old in enumerate(sorted(clusters.keys()))}
+        new_labels = [-1] * n
+        for i, lab in enumerate(labels):
+            if lab in old_to_new:
+                new_labels[i] = old_to_new[lab]
+
+        new_clusters: Dict[int, List[int]] = {}
+        for i, lab in enumerate(new_labels):
+            if lab == -1:
+                continue
+            new_clusters.setdefault(lab, []).append(i)
+
+        centroids: Dict[int, List[float]] = {}
+        radii: Dict[int, float] = {}
+        for cid, pts in new_clusters.items():
+            c = _centroid(X, pts)
+            centroids[cid] = c
+            dists = [_dist_to_centroid(X[i], c, self.metric) for i in pts]
+            radii[cid] = _percentile(dists, self.radius_percentile)
+
+        self.model_ = HDBSCANLiteModel(
+            metric=self.metric,
+            min_samples=self.min_samples,
+            min_cluster_size=self.min_cluster_size,
+            eps=eps,
+            labels_=new_labels,
+            centroids_=centroids,
+            radii_=radii,
+        )
+        return self.model_
+
+    def predict(self, X_new: List[List[float]]) -> List[int]:
+        if self.model_ is None or self._X_fit is None:
+            raise RuntimeError("Primero llama a fit(X).")
+        if not X_new:
+            return []
+
+        centroids = self.model_.centroids_
+        radii = self.model_.radii_
+        if not centroids:
+            # no hay clusters: todo ruido
+            return [-1] * len(X_new)
+
+        out = []
+        for x in X_new:
+            best_c = None
+            best_d = float("inf")
+            for cid, c in centroids.items():
+                d = _dist_to_centroid(x, c, self.model_.metric)
+                if d < best_d:
+                    best_d = d
+                    best_c = cid
+
+            # gating: si está demasiado lejos del cluster, márcalo como ruido
+            if best_c is None:
+                out.append(-1)
+            else:
+                if best_d <= radii.get(best_c, float("inf")):
+                    out.append(best_c)
+                else:
+                    out.append(-1)
+        return out
+
+
+# ----------------------------
+# Ejemplo de uso
+# ----------------------------
+if __name__ == "__main__":
+    # X: lista de embeddings (n x d) como listas de floats
+    X = [
+        [0.1, 0.2, 0.3],
+        [0.11, 0.19, 0.31],
+        [0.09, 0.21, 0.29],
+        [0.9, 0.85, 0.88],
+        [0.91, 0.86, 0.87],
+        [0.89, 0.84, 0.89],
+    ]
+
+    h = HDBSCANLite(metric="cosine", min_samples=2, min_cluster_size=2, eps_levels=40)
+    model = h.fit(X)
+
+    print("eps elegido:", model.eps)
+    print("labels fit:", model.labels_)
+
+    X_new = [
+        [0.12, 0.18, 0.33],
+        [0.95, 0.80, 0.90],
+        [0.0, 0.0, 0.0],  # probablemente ruido
+    ]
+    print("predict:", h.predict(X_new))
+
